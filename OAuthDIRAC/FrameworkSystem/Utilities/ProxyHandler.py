@@ -1,27 +1,19 @@
 """ Handler to serve the DIRAC proxy data
 """
 import re
-import json
 import time
 import base64
-import tornado
 
 from tornado import web, gen
 from tornado.template import Template
 
 from DIRAC import S_OK, S_ERROR, gConfig, gLogger
-from DIRAC.FrameworkSystem.Client.NotificationClient import NotificationClient
-from DIRAC.ConfigurationSystem.Client.Utilities import getOAuthAPI
-from DIRAC.FrameworkSystem.Client.ProxyManagerClient import gProxyManager
-from DIRAC.ConfigurationSystem.Client.Helpers import Registry
-
-from OAuthDIRAC.FrameworkSystem.Client.OAuthManagerClient import OAuthManagerClient
+from DIRAC.FrameworkSystem.Client.ProxyManagerClient import ProxyManagerClient
+from DIRAC.ConfigurationSystem.Client.Helpers.Registry import getDNForUsernameInGroup
 
 from WebAppDIRAC.Lib.WebHandler import WebHandler, asyncGen, WErr
 
 __RCSID__ = "$Id$"
-
-gOAuthCli = OAuthManagerClient()
 
 
 class ProxyHandler(WebHandler):
@@ -41,76 +33,69 @@ class ProxyHandler(WebHandler):
 
   @asyncGen
   def web_proxy(self):
-    """ Proxy management endpoint
-    """
-    __dn, __obj = None, None
-    optns = self.overpath.strip('/').split('/')
-    try:
-      __dn = base64.urlsafe_b64decode(str(re.match("([A-z0-9=-_]+)?", optns[0]).group())).rstrip("/")
-    except TypeError, e:
-      raise WErr(400, "Cannot decode path")
-    
-    if not __dn or (len(optns) == 2 and __dn):
-      __obj = re.match("(metadata)?", optns[-1]).group()
-    else:
-      raise WErr(404, "Wrone way")
+    """ Proxy management endpoint, use:
+          GET /proxy?<options> -- retrieve personal proxy
+            * options:
+              * voms - to get VOMSproxy(optional)
+              * lifetime - requested proxy live time(optional)
 
+          GET /proxy/<user>/<group>?<options> -- retrieve proxy
+            * user - user name
+            * group - group name
+            * options:
+              * voms - to get VOMSproxy(optional)
+              * lifetime - requested proxy live time(optional)
+
+          GET /proxy/metadata?<options> -- retrieve proxy metadata..
+            * options:
+
+        :return: json
+    """
+    voms = self.args.get('voms')
+    proxyLifeTime = 3600 * 12
+    if re.match('[0-9]+', self.args.get('lifetime') or ''):
+      proxyLifeTime = int(self.args.get('lifetime'))
+    optns = self.overpath.strip('/').split('/')
+    
     # GET
     if self.request.method == 'GET':
-      
       # Return content of Proxy DB
-      if __obj == 'metadata':
+      if 'metadata' in optns:
         pass
 
-      # Return proxy
-      else:
-        group = self.args.get('group')
-        userName = self.getUserName()
-        proxyLifeTime = 3600 * 12
-        if re.match('[0-9]+', self.args.get('lifetime') or ''):
-          proxyLifeTime = int(self.args.get('lifetime'))
-
-        # Need group to continue
-        if not group:
-          result = Registry.findDefaultGroupForUser(userName)
-          if not result['OK']:
-            raise WErr(500, result['Message'])
-          group = result['Value']
-        result = Registry.getGroupsForUser(userName)
-        if not result['OK']:
-          raise WErr(500, result['Message'])
-        elif group not in result['Value']:
-          raise WErr(500, '%s group is not found for %s user.' % (group, userName))
-        
-        # Get proxy to string
-        if not __dn:
-          result = Registry.getDNForUsername(userName)
-          if not result['OK']:
-            raise WErr(500, 'Cannot get proxy')
-          if not Registry.getGroupsForUser(userName)['OK']:
-            raise WErr(500, 'Cannot get proxy')
-          for DN in result['Value']:
-            result = Registry.getDNProperty(DN, 'Groups')
-            if not result['OK']:
-              raise WErr(500, 'Cannot get proxy, %s' % result['Message'])
-            groupList = result['Value'] or []
-            if not isinstance(groupList, list):
-              groupList = groupList.split(', ')
-            if group in groupList:
-              __dn = DN
-              break
-        if not __dn:
-          raise WErr(500, 'No DN found for %s@%s' % (userName, group))
-        if self.args.get('voms'):
-          voms = Registry.getVOForGroup(group)
-          result = gProxyManager.downloadVOMSProxy(DN, group, requiredVOMSAttribute=voms,
-                                                   requiredTimeLeft=proxyLifeTime)
-        else:
-          result = gProxyManager.downloadProxy(DN, group, requiredTimeLeft=proxyLifeTime)
+      # Return personal proxy
+      elif not self.overpath:
+        result = yield self.threadTask(ProxyManagerClient().downloadPersonalProxy, self.getUserName(),
+                                       self.getUserGroup(), requiredTimeLeft=proxyLifeTime, voms=voms)
         if not result['OK']:
           raise WErr(500, result['Message'])
         self.log.notice('Proxy was created.')
         result = result['Value'].dumpAllToString()
         if not result['OK']:
           raise WErr(500, result['Message'])
-        self.finish(result['Value'])
+        self.finishJEncode(result['Value'])
+
+      # Return proxy
+      elif len(optns) == 2:
+        user = optns[0]
+        group = optns[1]
+        
+        # Get proxy to string
+        result = getDNForUsernameInGroup(user, group)
+        if not result['OK'] or not result.get('Value'):
+          raise WErr(500, '%s@%s has no registred DN: %s' % (user, group, result.get('Message') or ""))
+        
+        if voms:
+          result = yield self.threadTask(ProxyManagerClient().downloadVOMSProxy, user, group, requiredTimeLeft=proxyLifeTime)
+        else:
+          result = yield self.threadTask(ProxyManagerClient().downloadProxy, user, group, requiredTimeLeft=proxyLifeTime)
+        if not result['OK']:
+          raise WErr(500, result['Message'])
+        self.log.notice('Proxy was created.')
+        result = result['Value'].dumpAllToString()
+        if not result['OK']:
+          raise WErr(500, result['Message'])
+        self.finishJEncode(result['Value'])
+
+      else:
+        raise WErr(404, "Wrone way")
